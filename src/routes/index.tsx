@@ -1,7 +1,7 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
+import type { ReviewStatus, SignItem, SignProject, VersionSnapshot } from "../types";
 import { analyzeSign, cloneTerms, diffText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
@@ -37,8 +37,36 @@ export default component$(() => {
   const replyingTo = useSignal("");
   const toast = useSignal("");
   const previewId = useSignal("");
+  const previewVersionId = useSignal("");
   const readOnly = useSignal(false);
-  const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const liveSign = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
+  const previewVersion = () => {
+    if (!previewVersionId.value) return undefined;
+    return liveSign().versions.find((version) => version.id === previewVersionId.value);
+  };
+  /** 只读查看指定冻结版本时，用快照内容拼出一条“当时的标识” */
+  const frozenViewSign = (version: VersionSnapshot): SignItem => ({
+    id: liveSign().id,
+    code: version.code ?? liveSign().code,
+    sourceText: version.sourceText,
+    targetLanguage: version.targetLanguage ?? liveSign().targetLanguage,
+    targetText: version.targetText,
+    scenario: version.scenario ?? liveSign().scenario,
+    regulation: version.regulation ?? liveSign().regulation,
+    status: version.status,
+    terms: cloneTerms(version.terms ?? []),
+    comments: structuredClone(version.comments ?? []),
+    versions: liveSign().versions,
+    emergencyRevision: false,
+    updatedAt: version.createdAt,
+  });
+  const active = () => {
+    if (readOnly.value) {
+      const version = previewVersion();
+      return version ? frozenViewSign(version) : liveSign();
+    }
+    return liveSign();
+  };
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
     past.value = [...past.value.slice(-49), structuredClone(project.value)];
@@ -108,22 +136,57 @@ export default component$(() => {
     const sign = project.value.signs.find((item) => item.id === project.value.activeSignId);
     if (!sign) return;
     const versionId = uid("version");
-    commit("保存版本快照", (draft) => {
+    commit("冻结审校记录", (draft) => {
       const current = draft.signs.find((item) => item.id === draft.activeSignId);
       if (!current) return;
       current.versions.unshift({
         id: versionId,
-        label: `版本 ${current.versions.length + 1}`,
+        label: `冻结版本 V${current.versions.length + 1}`,
         createdAt: new Date().toISOString(),
+        frozenBy: "当前审校员",
+        code: current.code,
         sourceText: current.sourceText,
+        targetLanguage: current.targetLanguage,
         targetText: current.targetText,
+        scenario: current.scenario,
+        regulation: current.regulation,
         status: current.status,
         terms: cloneTerms(current.terms),
+        comments: structuredClone(current.comments),
       });
       current.versions = current.versions.slice(0, 12);
     });
     selectedVersionId.value = versionId;
-    toast.value = "版本快照已保存";
+    toast.value = "审校记录已冻结留档";
+  });
+
+  const restoreVersion = $((versionId: string) => {
+    const sign = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    const version = sign?.versions.find((item) => item.id === versionId);
+    if (!sign || !version) return;
+    commit("恢复历史快照", (draft) => {
+      const current = draft.signs.find((item) => item.id === draft.activeSignId);
+      if (!current) return;
+      current.sourceText = version.sourceText;
+      current.targetText = version.targetText;
+      current.targetLanguage = version.targetLanguage ?? current.targetLanguage;
+      current.scenario = version.scenario ?? current.scenario;
+      current.regulation = version.regulation ?? current.regulation;
+      current.terms = cloneTerms(version.terms ?? []);
+      current.comments = structuredClone(version.comments ?? []);
+      // 恢复后必须重新走审校流程
+      current.status = "pending";
+    });
+    selectedVersionId.value = versionId;
+    toast.value = `已恢复 ${version.label}，状态回到待确认`;
+  });
+
+  const copyVersionLink = $((versionId: string) => {
+    const current = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    if (!current) return;
+    const url = `${window.location.origin}${window.location.pathname}?preview=${encodeURIComponent(current.id)}&version=${encodeURIComponent(versionId)}`;
+    void navigator.clipboard?.writeText(url).catch(() => undefined);
+    toast.value = "该冻结版本的只读链接已复制";
   });
 
   const addTerm = $(() => {
@@ -187,8 +250,10 @@ export default component$(() => {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
         if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
-        const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
+        const params = new URLSearchParams(window.location.search);
+        const requestedPreview = params.get("preview") ?? "";
         previewId.value = requestedPreview;
+        previewVersionId.value = params.get("version") ?? "";
         readOnly.value = Boolean(requestedPreview);
       } catch {
         // Keep bundled sample data when storage is unavailable or malformed.
@@ -248,25 +313,116 @@ export default component$(() => {
   if (readOnly.value) {
     const sign = active();
     const analysis = analyzeSign(sign, previewWidth.value, previewFont.value);
+    const frozen = previewVersion();
+    const versionMissing = Boolean(previewVersionId.value && !frozen);
+    const archivedComments = sign.comments;
     return (
       <main data-theme="corporate" class="min-h-screen bg-slate-100 p-6">
         <div class="mx-auto max-w-5xl">
-          <div class="mb-4 flex items-center justify-between">
+          <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
             <div>
-              <div class="text-xs font-bold uppercase tracking-[0.18em] text-slate-500">Read-only preview</div>
+              <div class="text-xs font-bold uppercase tracking-[0.18em] text-slate-500">
+                {frozen ? "Frozen review record · read-only" : "Read-only preview"}
+              </div>
               <h1 class="text-2xl font-bold text-slate-800">{sign.code} · {sign.scenario}</h1>
             </div>
-            <span class={`badge ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+            <div class="flex items-center gap-2">
+              {frozen && <span class="badge badge-info badge-lg gap-1">❄ {frozen.label}</span>}
+              <span class={`badge badge-lg ${statusClass(sign.status)}`}>{STATUS_LABELS[sign.status]}</span>
+            </div>
           </div>
-          <section class="rounded-3xl bg-white p-14 shadow-xl">
-            <div class="mb-3 text-center text-xs text-slate-400">中文原文</div>
-            <p class="mx-auto mb-10 max-w-2xl text-center text-lg text-slate-600">{sign.sourceText}</p>
+
+          {frozen && (
+            <div class="alert alert-info mb-4 items-start py-3 text-sm">
+              <span class="text-lg">❄</span>
+              <div>
+                <strong>冻结审校记录</strong>：本链接固定展示 {new Date(frozen.createdAt).toLocaleString()} 留档时的原文、译文、场景、法规、术语确认情况与审校意见；后续即使修改原文或移走术语，本页内容不变。
+                <div class="mt-1 text-xs opacity-80">留档人：{frozen.frozenBy || "未记录"}</div>
+              </div>
+            </div>
+          )}
+          {versionMissing && (
+            <div class="alert alert-warning mb-4 py-3 text-sm">
+              <span>未找到指定的冻结版本，以下为当前内容。</span>
+            </div>
+          )}
+
+          <section class="rounded-3xl bg-white p-10 shadow-xl">
+            <div class="mb-3 text-center text-xs text-slate-400">中文原文（{frozen ? "冻结时内容" : "当前内容"}）</div>
+            <p class="mx-auto mb-8 max-w-2xl text-center text-lg text-slate-600">{sign.sourceText}</p>
             <div class="mx-auto border-y-4 border-slate-800 py-10 text-center">
               <p class="whitespace-pre-line font-black leading-tight tracking-wide text-slate-900" style={{ fontSize: `${previewFont.value}px` }}>{analysis.visible.join("\n")}</p>
             </div>
-            <div class="mt-5 text-center text-sm text-slate-500">{sign.targetLanguage} · {sign.regulation}</div>
+            <div class="mt-5 grid gap-2 text-center text-sm text-slate-500 sm:grid-cols-2">
+              <div>{sign.targetLanguage}</div>
+              <div>法规/规范：{sign.regulation}</div>
+            </div>
+            {frozen && (
+              <div class="mt-3 grid gap-2 rounded-xl bg-slate-50 p-3 text-center text-xs text-slate-500 sm:grid-cols-3">
+                <div>标识编号：<strong class="text-slate-700">{sign.code}</strong></div>
+                <div>适用场景：<strong class="text-slate-700">{sign.scenario}</strong></div>
+                <div>留档时间：<strong class="text-slate-700">{new Date(frozen.createdAt).toLocaleString()}</strong></div>
+              </div>
+            )}
           </section>
-          <p class="mt-4 text-center text-xs text-slate-400">此链接读取当前浏览器中的本地版本，仅用于演示只读预览。</p>
+
+          <div class="mt-4 grid gap-4 md:grid-cols-2">
+            <section class="rounded-2xl bg-white p-5 shadow-sm">
+              <div class="flex items-center justify-between">
+                <h2 class="font-bold text-slate-700">术语绑定与确认情况</h2>
+                <span class="badge badge-outline">{sign.terms.length} 条{analysis.missingTerms.length > 0 ? ` · ${analysis.missingTerms.length} 条未命中` : ""}</span>
+              </div>
+              {sign.terms.length === 0 ? (
+                <p class="mt-3 text-xs text-slate-400">该冻结版本未绑定术语。</p>
+              ) : (
+                <ul class="mt-3 space-y-2">
+                  {sign.terms.map((item) => {
+                    const matched = sign.targetText.toLocaleLowerCase().includes(item.target.toLocaleLowerCase());
+                    return (
+                      <li key={item.id} class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2 text-sm">
+                        <span>{item.source} → <strong>{item.target}</strong></span>
+                        <span class={`badge badge-sm ${matched && item.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}>
+                          {matched ? (item.confirmed ? "已确认" : "待确认") : "未命中"}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
+
+            <section class="rounded-2xl bg-white p-5 shadow-sm">
+              <div class="flex items-center justify-between">
+                <h2 class="font-bold text-slate-700">审校意见{frozen ? "（冻结留档）" : ""}</h2>
+                <span class="badge badge-outline">{archivedComments.length} 条</span>
+              </div>
+              {archivedComments.length === 0 ? (
+                <p class="mt-3 text-xs text-slate-400">该版本没有审校意见。</p>
+              ) : (
+                <div class="mt-3 max-h-72 space-y-3 overflow-y-auto pr-1">
+                  {archivedComments.map((comment) => (
+                    <article key={comment.id} class={`rounded-xl border-l-4 bg-slate-50 p-3 ${comment.resolved ? "border-success opacity-70" : "border-warning"}`}>
+                      <div class="flex items-center justify-between text-xs">
+                        <strong>{comment.author}</strong>
+                        <span class="text-slate-400">{new Date(comment.createdAt).toLocaleString()}</span>
+                      </div>
+                      <p class="my-2 text-sm">{comment.body}</p>
+                      {comment.replies.map((reply) => (
+                        <div key={reply.id} class="ml-4 my-1 border-l-2 border-slate-200 pl-3 text-xs"><strong>{reply.author}</strong>：{reply.body}</div>
+                      ))}
+                      <div class="mt-1 text-[11px] text-slate-400">{comment.resolved ? "已解决" : "未解决"}</div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          </div>
+
+          <p class="mt-4 text-center text-xs text-slate-400">
+            {frozen
+              ? "此链接读取当前浏览器本地保存的冻结版本快照，内容已留档，不随后续修改变化。"
+              : "此链接读取当前浏览器中的本地版本，仅用于演示只读预览。"}
+          </p>
         </div>
       </main>
     );
@@ -396,7 +552,7 @@ export default component$(() => {
                 <div class="divider my-0"></div>
                 <div class="flex items-center justify-between">
                   <div><div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-500">Target</div><h2 class="font-bold">目标语言译文</h2></div>
-                  <button class="btn btn-sm btn-outline" onClick$={saveVersion}>保存版本快照</button>
+                  <button class="btn btn-sm btn-outline" onClick$={saveVersion}>❄ 冻结保存版本</button>
                 </div>
                 <textarea
                   class="textarea textarea-bordered min-h-36 w-full text-lg leading-8"
@@ -523,23 +679,45 @@ export default component$(() => {
             <div class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body p-4">
                 <div class="flex items-center justify-between">
-                  <div><h2 class="font-bold">版本比较</h2><p class="text-xs text-slate-500">旧版快照与当前译文逐词对比。</p></div>
+                  <div><h2 class="font-bold">冻结版本</h2><p class="text-xs text-slate-500">保存即留档完整审校记录，可比较、恢复或生成只读链接。</p></div>
                   <span class="badge badge-outline">{active().versions.length} 版</span>
                 </div>
                 {active().versions.length ? (
                   <>
-                    <select class="select select-sm select-bordered mt-3 w-full" value={selectedVersionId.value || active().versions[0].id} onChange$={(_, element) => selectedVersionId.value = element.value}>
-                      {active().versions.map((version) => <option key={version.id} value={version.id}>{`${version.label} · ${new Date(version.createdAt).toLocaleTimeString()}`}</option>)}
-                    </select>
-                    <div class="mt-3 rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
-                      {comparison().map((token, index) => (
-                        <span key={index} class={token.type === "add" ? "rounded bg-green-400/25 text-green-200" : token.type === "remove" ? "bg-red-400/25 text-red-200 line-through" : ""}>{token.value}</span>
-                      ))}
+                    <div class="mt-3 max-h-60 space-y-2 overflow-y-auto pr-1">
+                      {active().versions.map((version) => {
+                        const isSelected = (selectedVersionId.value || active().versions[0].id) === version.id;
+                        return (
+                          <div key={version.id} class={`rounded-xl border p-2 ${isSelected ? "border-blue-400 bg-blue-50" : "border-slate-200 bg-slate-50"}`}>
+                            <button class="block w-full text-left" onClick$={() => selectedVersionId.value = version.id}>
+                              <div class="flex items-center justify-between gap-2">
+                                <span class="truncate text-xs font-bold text-slate-700">❄ {version.label}</span>
+                                <span class={`badge badge-xs ${statusClass(version.status)}`}>{STATUS_LABELS[version.status]}</span>
+                              </div>
+                              <div class="mt-1 text-[11px] text-slate-500">
+                                {new Date(version.createdAt).toLocaleString()} · {(version.comments ?? []).length} 条意见
+                              </div>
+                            </button>
+                            <div class="mt-2 flex gap-1">
+                              <button class="btn btn-outline btn-xs flex-1" onClick$={() => copyVersionLink(version.id)}>复制只读链接</button>
+                              <button class="btn btn-xs btn-primary flex-1" onClick$={() => restoreVersion(version.id)}>恢复到当前</button>
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
-                    <div class="mt-2 flex gap-3 text-[11px]"><span class="text-green-700">绿：新增</span><span class="text-red-700">红：删除</span></div>
+                    <div class="mt-3">
+                      <div class="mb-1 text-[11px] font-bold text-slate-500">与当前译文比较</div>
+                      <div class="rounded-lg bg-slate-900 p-3 text-sm leading-7 text-slate-100">
+                        {comparison().map((token, index) => (
+                          <span key={index} class={token.type === "add" ? "rounded bg-green-400/25 text-green-200" : token.type === "remove" ? "bg-red-400/25 text-red-200 line-through" : ""}>{token.value}</span>
+                        ))}
+                      </div>
+                      <div class="mt-2 flex gap-3 text-[11px]"><span class="text-green-700">绿：当前新增</span><span class="text-red-700">红：旧版内容</span></div>
+                    </div>
                   </>
                 ) : (
-                  <div class="mt-3 rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">保存当前译文后会在这里生成可比较版本。</div>
+                  <div class="mt-3 rounded-xl border border-dashed p-5 text-center text-xs text-slate-400">冻结保存后，原文、译文、术语确认和审校意见都会留档在这里。</div>
                 )}
               </div>
             </div>
