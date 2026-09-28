@@ -28,10 +28,18 @@ export interface VersionSnapshot {
   id: string;
   label: string;
   createdAt: string;
+  frozenBy: string;
+  note: string;
+  /** 冻结时的完整标识信息，后续修改原文或移除术语都不会影响快照 */
+  code: string;
   sourceText: string;
   targetText: string;
+  targetLanguage: string;
+  scenario: string;
+  regulation: string;
   status: ReviewStatus;
   terms: TermBinding[];
+  comments: ReviewComment[];
 }
 
 export interface SignItem {

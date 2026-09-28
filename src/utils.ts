@@ -1,4 +1,4 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, SignItem, SignProject, TermBinding, VersionSnapshot } from "./types";
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -103,4 +103,27 @@ export function diffText(oldText: string, newText: string): DiffToken[] {
 
 export function cloneTerms(terms: TermBinding[]) {
   return structuredClone(terms);
+}
+
+/** 兼容旧版快照：补齐冻结存档所需的完整标识字段与审校意见 */
+export function normalizeProject(project: SignProject): SignProject {
+  for (const sign of project.signs) {
+    sign.versions = (sign.versions ?? []).map((version, index) => {
+      const snapshot: VersionSnapshot = {
+        ...version,
+        frozenBy: version.frozenBy || "历史版本",
+        note: version.note ?? "",
+        code: version.code ?? sign.code,
+        sourceText: version.sourceText ?? sign.sourceText,
+        targetText: version.targetText ?? sign.targetText,
+        targetLanguage: version.targetLanguage ?? sign.targetLanguage,
+        scenario: version.scenario ?? sign.scenario,
+        regulation: version.regulation ?? sign.regulation,
+        comments: version.comments ?? [],
+      };
+      if (!version.label) snapshot.label = `冻结版本 V${index + 1}`;
+      return snapshot;
+    });
+  }
+  return project;
 }
